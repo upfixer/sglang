@@ -35,6 +35,7 @@ struct Router {
     selector: HashMap<String, String>,
     service_discovery_port: u16,
     service_discovery_namespace: Option<String>,
+    enable_metrics: bool,
 }
 
 #[pymethods]
@@ -58,7 +59,8 @@ impl Router {
         service_discovery = false,
         selector = HashMap::new(),
         service_discovery_port = 80,
-        service_discovery_namespace = None
+        service_discovery_namespace = None,
+        enable_metrics = false
     ))]
     fn new(
         worker_urls: Vec<String>,
@@ -79,6 +81,7 @@ impl Router {
         selector: HashMap<String, String>,
         service_discovery_port: u16,
         service_discovery_namespace: Option<String>,
+        enable_metrics: bool,
     ) -> PyResult<Self> {
         Ok(Router {
             host,
@@ -99,6 +102,7 @@ impl Router {
             selector,
             service_discovery_port,
             service_discovery_namespace,
+            enable_metrics,
         })
     }
 
@@ -146,6 +150,7 @@ impl Router {
                 max_payload_size: self.max_payload_size,
                 log_dir: self.log_dir.clone(),
                 service_discovery_config,
+                enable_metrics: self.enable_metrics,
             })
             .await
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;

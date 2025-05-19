@@ -14,11 +14,69 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::spawn;
 use tracing::{error, info, warn, Level};
+use prometheus::{Counter, Gauge, IntCounter, IntGauge, Registry, Encoder};
 
 #[derive(Debug)]
 pub struct AppState {
     router: Router,
     client: Client,
+    metrics: Option<Arc<Metrics>>,
+}
+
+#[derive(Debug)]
+pub struct Metrics {
+    pub total_requests: Counter,
+    pub active_requests: Gauge,
+    pub request_duration: Counter,
+    pub worker_requests: IntCounter,
+    pub worker_active_requests: IntGauge,
+    pub registry: Registry,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        let registry = Registry::new();
+        
+        let total_requests = Counter::new(
+            "sgl_router_total_requests",
+            "Total number of requests processed"
+        ).unwrap();
+        
+        let active_requests = Gauge::new(
+            "sgl_router_active_requests",
+            "Number of requests currently being processed"
+        ).unwrap();
+        
+        let request_duration = Counter::new(
+            "sgl_router_request_duration_seconds",
+            "Total time spent processing requests in seconds"
+        ).unwrap();
+        
+        let worker_requests = IntCounter::new(
+            "sgl_router_worker_requests_total",
+            "Total number of requests processed per worker"
+        ).unwrap();
+        
+        let worker_active_requests = IntGauge::new(
+            "sgl_router_worker_active_requests",
+            "Number of active requests per worker"
+        ).unwrap();
+
+        registry.register(Box::new(total_requests.clone())).unwrap();
+        registry.register(Box::new(active_requests.clone())).unwrap();
+        registry.register(Box::new(request_duration.clone())).unwrap();
+        registry.register(Box::new(worker_requests.clone())).unwrap();
+        registry.register(Box::new(worker_active_requests.clone())).unwrap();
+
+        Self {
+            total_requests,
+            active_requests,
+            request_duration,
+            worker_requests,
+            worker_active_requests,
+            registry,
+        }
+    }
 }
 
 impl AppState {
@@ -26,10 +84,16 @@ impl AppState {
         worker_urls: Vec<String>,
         client: Client,
         policy_config: PolicyConfig,
+        enable_metrics: bool,
     ) -> Result<Self, String> {
         // Create router based on policy
         let router = Router::new(worker_urls, policy_config)?;
-        Ok(Self { router, client })
+        let metrics = if enable_metrics {
+            Some(Arc::new(Metrics::new()))
+        } else {
+            None
+        };
+        Ok(Self { router, client, metrics })
     }
 }
 
@@ -52,42 +116,42 @@ fn json_error_handler(_err: error::JsonPayloadError, _req: &HttpRequest) -> Erro
 #[get("/health")]
 async fn health(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/health", &req)
+        .route_to_first(&data.client, "/health", &req, &data.metrics)
         .await
 }
 
 #[get("/health_generate")]
 async fn health_generate(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/health_generate", &req)
+        .route_to_first(&data.client, "/health_generate", &req, &data.metrics)
         .await
 }
 
 #[get("/get_server_info")]
 async fn get_server_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_server_info", &req)
+        .route_to_first(&data.client, "/get_server_info", &req, &data.metrics)
         .await
 }
 
 #[get("/v1/models")]
 async fn v1_models(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/v1/models", &req)
+        .route_to_first(&data.client, "/v1/models", &req, &data.metrics)
         .await
 }
 
 #[get("/get_model_info")]
 async fn get_model_info(req: HttpRequest, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_to_first(&data.client, "/get_model_info", &req)
+        .route_to_first(&data.client, "/get_model_info", &req, &data.metrics)
         .await
 }
 
 #[post("/generate")]
 async fn generate(req: HttpRequest, body: Bytes, data: web::Data<AppState>) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, &req, &body, "/generate")
+        .route_generate_request(&data.client, &req, &body, "/generate", &data.metrics)
         .await
 }
 
@@ -98,7 +162,7 @@ async fn v1_chat_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, &req, &body, "/v1/chat/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/chat/completions", &data.metrics)
         .await
 }
 
@@ -109,7 +173,7 @@ async fn v1_completions(
     data: web::Data<AppState>,
 ) -> impl Responder {
     data.router
-        .route_generate_request(&data.client, &req, &body, "/v1/completions")
+        .route_generate_request(&data.client, &req, &body, "/v1/completions", &data.metrics)
         .await
 }
 
@@ -145,6 +209,21 @@ async fn remove_worker(
     HttpResponse::Ok().body(format!("Successfully removed worker: {}", worker_url))
 }
 
+#[get("/metrics")]
+async fn metrics_endpoint(data: web::Data<AppState>) -> impl Responder {
+    match &data.metrics {
+        Some(metrics) => {
+            let mut buffer = Vec::new();
+            let encoder = prometheus::TextEncoder::new();
+            encoder.encode(&metrics.registry.gather(), &mut buffer).unwrap();
+            HttpResponse::Ok()
+                .content_type("text/plain; version=0.0.4")
+                .body(buffer)
+        }
+        None => HttpResponse::NotFound().body("Metrics endpoint is disabled"),
+    }
+}
+
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
@@ -154,6 +233,7 @@ pub struct ServerConfig {
     pub max_payload_size: usize,
     pub log_dir: Option<String>,
     pub service_discovery_config: Option<ServiceDiscoveryConfig>,
+    pub enable_metrics: bool,
 }
 
 pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
@@ -201,8 +281,9 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     let app_state = web::Data::new(
         AppState::new(
             config.worker_urls.clone(),
-            client.clone(), // Clone the client here
+            client.clone(),
             config.policy_config.clone(),
+            config.enable_metrics,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?,
     );
@@ -235,7 +316,7 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
     info!("✅ Serving workers on {:?}", config.worker_urls);
 
     HttpServer::new(move || {
-        App::new()
+        let mut app = App::new()
             .app_data(app_state.clone())
             .app_data(
                 web::JsonConfig::default()
@@ -252,9 +333,15 @@ pub async fn startup(config: ServerConfig) -> std::io::Result<()> {
             .service(health_generate)
             .service(get_server_info)
             .service(add_worker)
-            .service(remove_worker)
-            // Default handler for unmatched routes.
-            .default_service(web::route().to(sink_handler))
+            .service(remove_worker);
+
+        // Only add metrics endpoint if enabled
+        if config.enable_metrics {
+            app = app.service(metrics_endpoint);
+        }
+
+        // Default handler for unmatched routes.
+        app.default_service(web::route().to(sink_handler))
     })
     .bind((config.host, config.port))?
     .run()

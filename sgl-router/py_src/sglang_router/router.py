@@ -40,6 +40,7 @@ class Router:
             worker URLs using this port. Default: 80
         service_discovery_namespace: Kubernetes namespace to watch for pods. If not provided,
             watches pods across all namespaces (requires cluster-wide permissions). Default: None
+        enable_metrics: Enable Prometheus metrics endpoint at /metrics. Default: False
     """
 
     def __init__(
@@ -62,6 +63,7 @@ class Router:
         selector: Dict[str, str] = None,
         service_discovery_port: int = 80,
         service_discovery_namespace: Optional[str] = None,
+        enable_metrics: bool = False,
     ):
         if selector is None:
             selector = {}
@@ -85,6 +87,7 @@ class Router:
             selector=selector,
             service_discovery_port=service_discovery_port,
             service_discovery_namespace=service_discovery_namespace,
+            enable_metrics=enable_metrics,
         )
 
     def start(self) -> None:

@@ -48,6 +48,8 @@ class RouterArgs:
     selector: Dict[str, str] = dataclasses.field(default_factory=dict)
     service_discovery_port: int = 80
     service_discovery_namespace: Optional[str] = None
+    # Metrics configuration
+    enable_metrics: bool = False
 
     @staticmethod
     def add_cli_args(
@@ -176,6 +178,11 @@ class RouterArgs:
             type=str,
             help="Kubernetes namespace to watch for pods. If not provided, watches all namespaces (requires cluster-wide permissions)",
         )
+        parser.add_argument(
+            f"--{prefix}enable-metrics",
+            action="store_true",
+            help="Enable Prometheus metrics endpoint at /metrics",
+        )
 
     @classmethod
     def from_cli_args(
@@ -215,6 +222,7 @@ class RouterArgs:
             service_discovery_namespace=getattr(
                 args, f"{prefix}service_discovery_namespace", None
             ),
+            enable_metrics=getattr(args, f"{prefix}enable_metrics", False),
         )
 
     @staticmethod
@@ -247,17 +255,15 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
     Args:
         args: Namespace object containing router configuration
             Can be either raw argparse.Namespace or converted RouterArgs
-
     Returns:
         Router instance if successful, None if failed
     """
     logger = logging.getLogger("router")
     try:
-        # Convert to RouterArgs if needed
-        if not isinstance(args, RouterArgs):
-            router_args = RouterArgs.from_cli_args(args)
-        else:
+        if isinstance(args, RouterArgs):
             router_args = args
+        else:
+            router_args = RouterArgs.from_cli_args(args)
 
         router = Router(
             worker_urls=router_args.worker_urls,
@@ -278,14 +284,14 @@ def launch_router(args: argparse.Namespace) -> Optional[Router]:
             selector=router_args.selector,
             service_discovery_port=router_args.service_discovery_port,
             service_discovery_namespace=router_args.service_discovery_namespace,
+            enable_metrics=router_args.enable_metrics,
         )
 
         router.start()
         return router
-
     except Exception as e:
-        logger.error(f"Error starting router: {e}")
-        raise e
+        logger.error(f"Failed to start router: {e}")
+        return None
 
 
 class CustomHelpFormatter(

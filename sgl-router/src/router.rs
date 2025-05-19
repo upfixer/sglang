@@ -12,6 +12,7 @@ use std::thread;
 use std::time::Duration;
 use tokio;
 use tracing::{debug, error, info, warn};
+use crate::server::Metrics;
 
 fn copy_request_headers(req: &HttpRequest) -> Vec<(String, String)> {
     req.headers()
@@ -327,7 +328,14 @@ impl Router {
         worker_url: &str,
         route: &str,
         req: &HttpRequest,
+        metrics: &Option<Arc<Metrics>>,
     ) -> HttpResponse {
+        let start_time = std::time::Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.active_requests.inc();
+            metrics.worker_active_requests.inc();
+        }
+
         let mut request_builder = client.get(format!("{}{}", worker_url, route));
 
         // Copy all headers from original request except for /health because it does not need authorization
@@ -337,7 +345,7 @@ impl Router {
             }
         }
 
-        match request_builder.send().await {
+        let response = match request_builder.send().await {
             Ok(res) => {
                 let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
                     .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
@@ -352,7 +360,17 @@ impl Router {
                 "Failed to send request to worker {}: {}",
                 worker_url, e
             )),
+        };
+
+        if let Some(metrics) = metrics {
+            metrics.total_requests.inc();
+            metrics.worker_requests.inc();
+            metrics.request_duration.inc_by(start_time.elapsed().as_secs_f64());
+            metrics.active_requests.dec();
+            metrics.worker_active_requests.dec();
         }
+
+        response
     }
 
     pub async fn route_to_first(
@@ -360,6 +378,7 @@ impl Router {
         client: &reqwest::Client,
         route: &str,
         req: &HttpRequest,
+        metrics: &Option<Arc<Metrics>>,
     ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
@@ -376,14 +395,14 @@ impl Router {
                             info!("Retrying request after {} failed attempts", total_retries);
                         }
 
-                        let response = self.send_request(client, &worker_url, route, req).await;
+                        let response = self.send_request(client, &worker_url, route, req, metrics).await;
 
                         if response.status().is_success() {
                             return response;
                         } else {
                             // if the worker is healthy, it means the request is bad, so return the error response
                             let health_response =
-                                self.send_request(client, &worker_url, "/health", req).await;
+                                self.send_request(client, &worker_url, "/health", req, metrics).await;
                             if health_response.status().is_success() {
                                 return response;
                             }
@@ -553,7 +572,14 @@ impl Router {
         body: &Bytes,
         route: &str,
         worker_url: &str,
+        metrics: &Option<Arc<Metrics>>,
     ) -> HttpResponse {
+        let start_time = std::time::Instant::now();
+        if let Some(metrics) = metrics {
+            metrics.active_requests.inc();
+            metrics.worker_active_requests.inc();
+        }
+
         let is_stream = serde_json::from_slice::<serde_json::Value>(&body)
             .map(|v| v.get("stream").and_then(|s| s.as_bool()).unwrap_or(false))
             .unwrap_or(false);
@@ -575,7 +601,7 @@ impl Router {
         let status = actix_web::http::StatusCode::from_u16(res.status().as_u16())
             .unwrap_or(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR);
 
-        if !is_stream {
+        let response = if !is_stream {
             // For non-streaming requests, get response first
             let response = match res.bytes().await {
                 Ok(body) => HttpResponse::build(status).body(body.to_vec()),
@@ -585,13 +611,12 @@ impl Router {
                 }
             };
 
-            // Then decrement running queue counter if using CacheAware
-            if let Router::CacheAware { running_queue, .. } = self {
-                if let Ok(mut queue) = running_queue.lock() {
-                    if let Some(count) = queue.get_mut(worker_url) {
-                        *count = count.saturating_sub(1);
-                    }
-                }
+            if let Some(metrics) = metrics {
+                metrics.total_requests.inc();
+                metrics.worker_requests.inc();
+                metrics.request_duration.inc_by(start_time.elapsed().as_secs_f64());
+                metrics.active_requests.dec();
+                metrics.worker_active_requests.dec();
             }
 
             response
@@ -626,7 +651,17 @@ impl Router {
                 .streaming(res.bytes_stream().map_err(|_| {
                     actix_web::error::ErrorInternalServerError("Failed to read stream")
                 }))
+        };
+
+        if let Some(metrics) = metrics {
+            metrics.total_requests.inc();
+            metrics.worker_requests.inc();
+            metrics.request_duration.inc_by(start_time.elapsed().as_secs_f64());
+            metrics.active_requests.dec();
+            metrics.worker_active_requests.dec();
         }
+
+        response
     }
 
     pub async fn route_generate_request(
@@ -635,6 +670,7 @@ impl Router {
         req: &HttpRequest,
         body: &Bytes,
         route: &str,
+        metrics: &Option<Arc<Metrics>>,
     ) -> HttpResponse {
         const MAX_REQUEST_RETRIES: u32 = 3;
         const MAX_TOTAL_RETRIES: u32 = 6;
@@ -650,7 +686,7 @@ impl Router {
                     info!("Retrying request after {} failed attempts", total_retries);
                 }
                 let response = self
-                    .send_generate_request(client, req, body, route, &worker_url)
+                    .send_generate_request(client, req, body, route, &worker_url, metrics)
                     .await;
 
                 if response.status().is_success() {
@@ -658,7 +694,7 @@ impl Router {
                 } else {
                     // if the worker is healthy, it means the request is bad, so return the error response
                     let health_response =
-                        self.send_request(client, &worker_url, "/health", req).await;
+                        self.send_request(client, &worker_url, "/health", req, metrics).await;
                     if health_response.status().is_success() {
                         return response;
                     }
